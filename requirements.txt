@@ -1,3 +1,7 @@
-altair
-pandas
 streamlit
+google-generativeai
+torch
+transformers
+deepface
+tf-keras
+Pillow
