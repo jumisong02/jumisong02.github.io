@@ -1,14 +1,14 @@
 ---
-title: Streamlit Template Space
+title: StoryboardGen
 emoji: 🚀
 colorFrom: red
 colorTo: red
 sdk: docker
 app_port: 8501
 tags:
-  - streamlit
+- streamlit
 pinned: false
-short_description: Streamlit template space
+short_description: Generating Storyboard to make a short film
 ---
 
 # Welcome to Streamlit!
