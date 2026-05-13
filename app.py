@@ -34,11 +34,13 @@ except ImportError:
     DINO_AVAILABLE = False
 
 # ── API 클라이언트 ─────────────────────────────────────────────
-client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+client = genai.Client(
+    api_key=st.secrets.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY")
+)
 
 # ── 세션 초기화 ────────────────────────────────────────────────
 defaults = {
-    'stage': 'input',           # input → character → scenario → sample → storyboard
+    'stage': 'input',
     'character_image': None,
     'storyboard_data': [],
     'sample_data': [],
@@ -46,7 +48,7 @@ defaults = {
     'char_name': '',
     'char_description': '',
     'act_plan': None,
-    'scenes_by_act': None,      # 확정된 씬 텍스트 (사용자 언어)
+    'scenes_by_act': None,      # {act: [{text, type, camera, duration, reason}]}
     'check_method': 'A: DeepFace + CLIP',
     'df_threshold': 60,
     'clip_threshold': 60,
@@ -91,53 +93,91 @@ def bytes_to_pil(img_bytes):
 
 
 # ══════════════════════════════════════════════════════════════
+# [헬퍼] 씬 유형별 검수 전략
+# ══════════════════════════════════════════════════════════════
+SCENE_TYPE_CONFIG = {
+    "face_visible": {
+        "label": "얼굴 노출",
+        "emoji": "👤",
+        "use_deepface": True,
+        "use_clip": True,
+        "use_dino": False,
+        "correction_strategy": "face_focus",  # 얼굴 크게, 정면
+    },
+    "face_hidden": {
+        "label": "얼굴 미노출",
+        "emoji": "🎭",
+        "use_deepface": False,
+        "use_clip": True,
+        "use_dino": True,
+        "correction_strategy": "body_focus",  # 의상/체형 강조
+    },
+    "crowd": {
+        "label": "군중씬",
+        "emoji": "👥",
+        "use_deepface": False,
+        "use_clip": False,
+        "use_dino": True,
+        "correction_strategy": "composition_focus",  # 전체 구성
+    },
+}
+
+
+# ══════════════════════════════════════════════════════════════
 # [헬퍼] 검수 함수들
 # ══════════════════════════════════════════════════════════════
-def check_deepface_clip(ref_bytes, gen_bytes):
-    result = {"deepface_score": -1, "deepface_passed": True,
-              "deepface_reason": "미실행", "clip_score": -1, "clip_reason": "미실행"}
+def check_deepface(ref_bytes, gen_bytes):
+    result = {"deepface_score": -1, "deepface_passed": True, "deepface_reason": "미실행"}
+    if not DEEPFACE_AVAILABLE:
+        result["deepface_reason"] = "미설치"
+        return result
     ref_path = gen_path = None
-    if DEEPFACE_AVAILABLE:
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f1:
-                f1.write(ref_bytes); ref_path = f1.name
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f2:
-                f2.write(gen_bytes); gen_path = f2.name
-            df = DeepFace.verify(img1_path=ref_path, img2_path=gen_path,
-                                 model_name="Facenet512", detector_backend="retinaface",
-                                 distance_metric="cosine", enforce_detection=False)
-            dist = df.get("distance", 1.0)
-            score = round(max(0.0, (1.0 - dist) * 100), 1)
-            result["deepface_score"] = score
-            result["deepface_passed"] = df.get("verified", False)
-            result["deepface_reason"] = f"유사도 {score}점 (distance={dist:.3f})"
-        except Exception as e:
-            err = str(e)
-            result["deepface_reason"] = "얼굴 미검출" if "face" in err.lower() else f"오류: {err}"
-        finally:
-            for p in [ref_path, gen_path]:
-                try: os.unlink(p) if p else None
-                except: pass
-    if CLIP_AVAILABLE:
-        try:
-            clip_model, clip_proc = load_clip_model()
-            inputs = clip_proc(images=[bytes_to_pil(ref_bytes), bytes_to_pil(gen_bytes)],
-                               return_tensors="pt", padding=True)
-            with torch.no_grad():
-                feats = clip_model.get_image_features(**inputs)
-            feats = feats / feats.norm(dim=-1, keepdim=True)
-            sim = (feats[0] @ feats[1]).item()
-            clip_score = round(max(0.0, sim) * 100, 1)
-            result["clip_score"] = clip_score
-            result["clip_reason"] = f"CLIP {clip_score}점 (cosine={sim:.3f})"
-        except Exception as e:
-            result["clip_reason"] = f"CLIP 오류: {e}"
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f1:
+            f1.write(ref_bytes); ref_path = f1.name
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f2:
+            f2.write(gen_bytes); gen_path = f2.name
+        df = DeepFace.verify(img1_path=ref_path, img2_path=gen_path,
+                             model_name="Facenet512", detector_backend="retinaface",
+                             distance_metric="cosine", enforce_detection=False)
+        dist = df.get("distance", 1.0)
+        score = round(max(0.0, (1.0 - dist) * 100), 1)
+        result["deepface_score"] = score
+        result["deepface_passed"] = df.get("verified", False)
+        result["deepface_reason"] = f"{score}점 (distance={dist:.3f})"
+    except Exception as e:
+        err = str(e)
+        result["deepface_reason"] = "얼굴 미검출" if "face" in err.lower() else f"오류: {err}"
+    finally:
+        for p in [ref_path, gen_path]:
+            try: os.unlink(p) if p else None
+            except: pass
+    return result
+
+def check_clip(ref_bytes, gen_bytes):
+    result = {"clip_score": -1, "clip_reason": "미실행"}
+    if not CLIP_AVAILABLE:
+        result["clip_reason"] = "미설치"
+        return result
+    try:
+        clip_model, clip_proc = load_clip_model()
+        inputs = clip_proc(images=[bytes_to_pil(ref_bytes), bytes_to_pil(gen_bytes)],
+                           return_tensors="pt", padding=True)
+        with torch.no_grad():
+            feats = clip_model.get_image_features(**inputs)
+        feats = feats / feats.norm(dim=-1, keepdim=True)
+        sim = (feats[0] @ feats[1]).item()
+        score = round(max(0.0, sim) * 100, 1)
+        result["clip_score"] = score
+        result["clip_reason"] = f"{score}점 (cosine={sim:.3f})"
+    except Exception as e:
+        result["clip_reason"] = f"오류: {e}"
     return result
 
 def check_dino(ref_bytes, gen_bytes):
     result = {"dino_score": -1, "dino_reason": "미실행"}
     if not DINO_AVAILABLE:
-        result["dino_reason"] = "DINOv2 미설치"
+        result["dino_reason"] = "미설치"
         return result
     try:
         dino_model, dino_proc = load_dino_model()
@@ -148,55 +188,128 @@ def check_dino(ref_bytes, gen_bytes):
         feats = outputs.last_hidden_state[:, 0, :]
         feats = feats / feats.norm(dim=-1, keepdim=True)
         sim = (feats[0] @ feats[1]).item()
-        dino_score = round(max(0.0, sim) * 100, 1)
-        result["dino_score"] = dino_score
-        result["dino_reason"] = f"DINOv2 {dino_score}점 (cosine={sim:.3f})"
+        score = round(max(0.0, sim) * 100, 1)
+        result["dino_score"] = score
+        result["dino_reason"] = f"{score}점 (cosine={sim:.3f})"
     except Exception as e:
-        result["dino_reason"] = f"DINOv2 오류: {e}"
+        result["dino_reason"] = f"오류: {e}"
     return result
 
-def run_similarity_check(ref_bytes, gen_bytes, check_method, df_thr, clip_thr, dino_thr):
-    result_a = check_deepface_clip(ref_bytes, gen_bytes)
-    result_b = check_dino(ref_bytes, gen_bytes)
 
-    if check_method.startswith("A"):
-        df_s = result_a["deepface_score"]
-        cl_s = result_a["clip_score"]
-        df_ok = result_a["deepface_passed"] and (df_s == -1 or df_s >= df_thr)
+def run_adaptive_check(ref_bytes, gen_bytes, scene_type,
+                       check_method, df_thr, clip_thr, dino_thr):
+    """
+    씬 유형에 따라 적용할 모델을 결정하고 통과 여부 판정.
+    check_method는 씬 유형이 override하지 않는 경우의 기본값.
+    """
+    cfg = SCENE_TYPE_CONFIG.get(scene_type, SCENE_TYPE_CONFIG["face_visible"])
+
+    # 항상 세 모델 모두 실행 (비교 데이터 수집)
+    df_result  = check_deepface(ref_bytes, gen_bytes)
+    cl_result  = check_clip(ref_bytes, gen_bytes)
+    di_result  = check_dino(ref_bytes, gen_bytes)
+
+    df_s = df_result["deepface_score"]
+    cl_s = cl_result["clip_score"]
+    di_s = di_result["dino_score"]
+
+    # 씬 유형별 통과 판정
+    conditions = []
+    fail_reasons = []
+
+    if cfg["use_deepface"]:
+        df_ok = df_result["deepface_passed"] and (df_s == -1 or df_s >= df_thr)
+        conditions.append(df_ok)
+        if df_s != -1 and not df_result["deepface_passed"]:
+            fail_reasons.append(f"DeepFace 기준 미달 ({df_s}점)")
+        elif df_s != -1 and not df_ok:
+            fail_reasons.append(f"DeepFace 슬라이더 미달 ({df_s}점 < {df_thr}점)")
+
+    if cfg["use_clip"]:
         cl_ok = (cl_s == -1 or cl_s >= clip_thr)
-        overall = df_ok and cl_ok
-        if df_s == -1: fail = None
-        elif not result_a["deepface_passed"]: fail = f"DeepFace 기준 미달 ({df_s}점)"
-        elif not df_ok: fail = f"DeepFace 슬라이더 미달 ({df_s}점 < {df_thr}점)"
-        elif not cl_ok: fail = f"CLIP 기준 미달 ({cl_s}점 < {clip_thr}점)"
-        else: fail = None
-    else:
-        di_s = result_b["dino_score"]
-        overall = (di_s == -1 or di_s >= dino_thr)
-        fail = None if (di_s == -1 or overall) else f"DINOv2 기준 미달 ({di_s}점 < {dino_thr}점)"
+        conditions.append(cl_ok)
+        if cl_s != -1 and not cl_ok:
+            fail_reasons.append(f"CLIP 미달 ({cl_s}점 < {clip_thr}점)")
 
-    return {**result_a, **result_b, "overall_passed": overall, "fail_reason": fail}
+    if cfg["use_dino"]:
+        di_ok = (di_s == -1 or di_s >= dino_thr)
+        conditions.append(di_ok)
+        if di_s != -1 and not di_ok:
+            fail_reasons.append(f"DINOv2 미달 ({di_s}점 < {dino_thr}점)")
+
+    overall = all(conditions) if conditions else True
+    fail = " | ".join(fail_reasons) if fail_reasons else None
+
+    return {
+        **df_result, **cl_result, **di_result,
+        "overall_passed": overall,
+        "fail_reason": fail,
+        "scene_type": scene_type,
+        "active_models": [k for k in ["deepface","clip","dino"]
+                          if cfg.get(f"use_{k}", False)],
+    }
 
 
 # ══════════════════════════════════════════════════════════════
-# [헬퍼] 이미지 생성
+# [헬퍼] 씬 유형별 Self-Correction 프롬프트
 # ══════════════════════════════════════════════════════════════
-def build_prompt(name, desc, scene_text, prev_score=-1, attempt=1):
-    if attempt == 1 or prev_score < 0:
-        return (
-            f"You are a cinematic image generator. Character in reference image: {name}. "
-            f"Generate hyperrealistic cinematic film still (16:9) where {name}: {scene_text}. "
-            f"CRITICAL: Keep {name}'s face, body, costume EXACTLY identical to reference. "
-            "ARRI Alexa 65, anamorphic lens, 8K, dramatic lighting, shallow DOF."
-        )
-    return (
-        f"Self-correction attempt #{attempt}. Previous similarity: {prev_score:.1f}/100 (FAILED). "
-        f"Show {name}'s face MORE clearly. Closer framing. Prioritize face/costume accuracy. "
-        f"Character {name} ({desc}): {scene_text}. 16:9 cinematic. Face must match reference exactly."
+def build_prompt(name, desc, scene_text, scene_type, prev_score=-1, attempt=1):
+    cfg = SCENE_TYPE_CONFIG.get(scene_type, SCENE_TYPE_CONFIG["face_visible"])
+    strategy = cfg["correction_strategy"]
+
+    base = (
+        f"You are a cinematic image generator. "
+        f"The character in the reference image is named {name}. "
+        f"Generate a hyperrealistic cinematic film still (16:9 widescreen). "
+        f"Scene: {scene_text}. "
+        f"CRITICAL: Keep {name}'s costume, hair, and overall appearance EXACTLY identical to reference. "
+        "Shot on ARRI Alexa 65, anamorphic lens, 8K, dramatic cinematic lighting."
     )
 
-def generate_image(name, desc, scene_text, ref_bytes, prev_score=-1, attempt=1):
-    prompt = build_prompt(name, desc, scene_text, prev_score, attempt)
+    if attempt == 1 or prev_score < 0:
+        # 씬 유형별 초기 프롬프트 지시
+        if scene_type == "face_visible":
+            return base + (
+                f" Ensure {name}'s face is CLEARLY VISIBLE and in SHARP FOCUS. "
+                "Use medium shot or closer. Face must match reference exactly."
+            )
+        elif scene_type == "face_hidden":
+            return base + (
+                f" The scene may show {name} from behind or at distance — this is intentional. "
+                f"Focus on consistent body shape, costume, and silhouette of {name}. "
+                "Do NOT force a face reveal if the scene doesn't call for it."
+            )
+        else:  # crowd
+            return base + (
+                f" Focus on overall composition and atmosphere. "
+                f"{name} may be one of many figures. Prioritize scene fidelity over face visibility."
+            )
+
+    # Self-Correction: 전략별 분기
+    if strategy == "face_focus":
+        return (
+            f"Self-correction attempt #{attempt}. Previous face similarity: {prev_score:.1f}/100 (FAILED). "
+            f"Strategy: Show {name}'s face MORE clearly. "
+            "Use closer framing (medium-close or close-up). Ensure face is front-facing and well-lit. "
+            f"Scene context: {scene_text}. 16:9. Face must match reference exactly."
+        )
+    elif strategy == "body_focus":
+        return (
+            f"Self-correction attempt #{attempt}. Previous body/costume similarity: {prev_score:.1f}/100 (FAILED). "
+            f"Strategy: Emphasize {name}'s costume, body shape, and silhouette consistency. "
+            "Do NOT force face visibility — maintain the intended camera angle. "
+            f"Scene: {scene_text}. Costume and body proportions must match reference exactly."
+        )
+    else:  # composition_focus
+        return (
+            f"Self-correction attempt #{attempt}. Previous composition similarity: {prev_score:.1f}/100 (FAILED). "
+            f"Strategy: Improve overall scene composition and atmosphere consistency. "
+            f"Scene: {scene_text}. Maintain visual style and lighting from reference."
+        )
+
+
+def generate_image(name, desc, scene_text, scene_type, ref_bytes, prev_score=-1, attempt=1):
+    prompt = build_prompt(name, desc, scene_text, scene_type, prev_score, attempt)
     resp = client.models.generate_content(
         model='gemini-2.5-flash-image',
         contents=[
@@ -215,11 +328,15 @@ def generate_image(name, desc, scene_text, ref_bytes, prev_score=-1, attempt=1):
 
 
 # ══════════════════════════════════════════════════════════════
-# [헬퍼] 씬 1개 생성 + 검수 루프
+# [헬퍼] 씬 1개 생성 + 적응형 검수 루프
 # ══════════════════════════════════════════════════════════════
-def generate_and_check(name, desc, scene_text, ref_bytes,
+def generate_and_check(name, desc, scene_info, ref_bytes,
                        check_method, df_thr, clip_thr, dino_thr, max_retries,
                        label, status_box):
+    scene_text = scene_info.get("text", "")
+    scene_type = scene_info.get("type", "face_visible")
+    cfg = SCENE_TYPE_CONFIG.get(scene_type, SCENE_TYPE_CONFIG["face_visible"])
+
     best_image = None
     best_scores = {}
     passed = False
@@ -227,13 +344,19 @@ def generate_and_check(name, desc, scene_text, ref_bytes,
     prev_score = -1
 
     for attempt in range(1, max_retries + 1):
+        type_tag = f"[{cfg['emoji']} {cfg['label']}]"
         if attempt == 1:
-            status_box.info(f"🎨 **{label}** — 생성 중...")
+            status_box.info(f"🎨 **{label}** {type_tag} — 생성 중...")
         else:
-            status_box.info(f"🔄 **{label}** — {attempt}차 Self-Correction (이전: {prev_score:.1f}점)")
+            status_box.info(
+                f"🔄 **{label}** {type_tag} — {attempt}차 Self-Correction "
+                f"({cfg['correction_strategy']} 전략 | 이전: {prev_score:.1f}점)"
+            )
 
         try:
-            image_bytes = generate_image(name, desc, scene_text, ref_bytes, prev_score, attempt)
+            image_bytes = generate_image(
+                name, desc, scene_text, scene_type, ref_bytes, prev_score, attempt
+            )
         except Exception as e:
             status_box.error(f"생성 오류: {e}")
             break
@@ -242,11 +365,21 @@ def generate_and_check(name, desc, scene_text, ref_bytes,
             status_box.warning("이미지 응답 없음, 재시도...")
             continue
 
-        check = run_similarity_check(ref_bytes, image_bytes, check_method, df_thr, clip_thr, dino_thr)
+        check = run_adaptive_check(
+            ref_bytes, image_bytes, scene_type,
+            check_method, df_thr, clip_thr, dino_thr
+        )
         attempt_passed = check["overall_passed"]
         fail_reason = check.get("fail_reason")
 
-        active_score = check.get("deepface_score", -1) if check_method.startswith("A") else check.get("dino_score", -1)
+        # Self-Correction용 기준 점수 (씬 유형별 주력 모델 기준)
+        if scene_type == "face_visible":
+            active_score = check.get("deepface_score", -1)
+        elif scene_type == "face_hidden":
+            active_score = check.get("clip_score", -1)
+        else:
+            active_score = check.get("dino_score", -1)
+
         if active_score != -1:
             prev_score = active_score
 
@@ -260,14 +393,24 @@ def generate_and_check(name, desc, scene_text, ref_bytes,
             }
 
         all_attempts.append({
-            "attempt": attempt, "image_bytes": image_bytes,
-            "check": check, "passed": attempt_passed,
-            "fail_reason": fail_reason, "self_corrected": attempt > 1,
+            "attempt": attempt,
+            "image_bytes": image_bytes,
+            "check": check,
+            "passed": attempt_passed,
+            "fail_reason": fail_reason,
+            "self_corrected": attempt > 1,
+            "strategy": cfg["correction_strategy"],
         })
 
         if attempt_passed:
             passed = True
-            status_box.success(f"✅ **{label}** 통과!")
+            active_models = check.get("active_models", [])
+            score_summary = " | ".join([
+                f"DeepFace:{check.get('deepface_score',-1)}점" if "deepface" in active_models else "",
+                f"CLIP:{check.get('clip_score',-1)}점" if "clip" in active_models else "",
+                f"DINOv2:{check.get('dino_score',-1)}점" if "dino" in active_models else "",
+            ]).strip(" |")
+            status_box.success(f"✅ **{label}** 통과! ({score_summary})")
             break
         else:
             status_box.warning(f"⚠️ **{label}** {attempt}차 탈락 — {fail_reason}")
@@ -280,32 +423,99 @@ def generate_and_check(name, desc, scene_text, ref_bytes,
             f"DINOv2:{best_scores.get('dino',-1)})"
         )
 
-    return {"image_bytes": best_image, "passed": passed,
-            "best_scores": best_scores, "all_attempts": all_attempts}
+    return {
+        "image_bytes": best_image,
+        "passed": passed,
+        "best_scores": best_scores,
+        "all_attempts": all_attempts,
+        "scene_type": scene_type,
+    }
 
 
 # ══════════════════════════════════════════════════════════════
 # [헬퍼] 점수 배지
 # ══════════════════════════════════════════════════════════════
-def score_badge(score, label, threshold=60):
+def score_badge(score, label, threshold=60, active=True):
+    if not active: return f"⚪ {label}: (미적용)"
     if score == -1: return f"🔵 {label}: N/A"
     color = "🟢" if score >= threshold else "🔴"
     return f"{color} {label}: {score}점"
 
 
 # ══════════════════════════════════════════════════════════════
-# [헬퍼] 스토리보드 ZIP 다운로드 데이터 생성
+# [헬퍼] ZIP 생성 (이미지)
 # ══════════════════════════════════════════════════════════════
-def make_zip(storyboard_data):
+def make_image_zip(storyboard_data):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for scene in storyboard_data:
             act = scene.get("act", "unknown")
             cut = scene.get("cut_num", 0)
-            filename = f"{act}_{cut:02d}컷.png"
-            zf.writestr(filename, scene["image_bytes"])
+            zf.writestr(f"{act}_{cut:02d}컷.png", scene["image_bytes"])
     buf.seek(0)
     return buf.getvalue()
+
+
+# ══════════════════════════════════════════════════════════════
+# [헬퍼] 시나리오 TXT 생성
+# ══════════════════════════════════════════════════════════════
+def make_scenario_txt(char_name, act_plan, scenes_by_act, storyboard_data):
+    lines = []
+    lines.append("=" * 60)
+    lines.append("단편 영화 AI 콘티 제작소 — 시나리오 & 스토리보드")
+    lines.append("=" * 60)
+    lines.append(f"캐릭터: {char_name}")
+
+    if act_plan:
+        lines.append(f"장르: {act_plan.get('genre', 'N/A')}")
+        lines.append(f"속도감: {act_plan.get('pacing', 'N/A')}")
+        lines.append(f"분석 근거: {act_plan.get('reasoning', 'N/A')}")
+        total_dur = act_plan.get('total_duration_sec', 300)
+        lines.append(f"예상 총 길이: {total_dur}초 ({total_dur//60}분 {total_dur%60}초)")
+    lines.append("")
+
+    ACT_CONFIG = [("1막", "설정 Setup", "🌅"), ("2막", "대립 Confrontation", "⚡"), ("3막", "해결 Resolution", "🌟")]
+
+    for act_kr, act_label, emoji in ACT_CONFIG:
+        scenes_list = scenes_by_act.get(act_kr, [])
+        if not scenes_list:
+            continue
+
+        act_dur = sum(s.get("duration", 0) for s in scenes_list)
+        lines.append(f"{emoji} {act_kr} — {act_label}  (총 {act_dur}초)")
+        lines.append("-" * 40)
+
+        for j, scene_info in enumerate(scenes_list):
+            s_type = scene_info.get("type", "face_visible")
+            cfg = SCENE_TYPE_CONFIG.get(s_type, {})
+            type_label = cfg.get("label", s_type)
+            camera = scene_info.get("camera", "")
+            duration = scene_info.get("duration", 0)
+            reason = scene_info.get("reason", "")
+
+            # 검수 결과 있으면 같이 기록
+            score_line = ""
+            for sb in storyboard_data:
+                if sb.get("act") == act_kr and sb.get("cut_num") == j + 1:
+                    sc = sb.get("best_scores", {})
+                    score_line = (
+                        f"  → 검수: DeepFace {sc.get('deepface',-1)}점 | "
+                        f"CLIP {sc.get('clip',-1)}점 | DINOv2 {sc.get('dino',-1)}점 | "
+                        f"{'✅ 통과' if sb.get('passed') else '⚠️ 최고점 채택'}"
+                    )
+                    break
+
+            lines.append(f"  씬{j+1} [{type_label} / {camera} / {duration}초]")
+            lines.append(f"  {scene_info.get('text', '')}")
+            if reason:
+                lines.append(f"  (분류 근거: {reason})")
+            if score_line:
+                lines.append(score_line)
+            lines.append("")
+
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -315,9 +525,9 @@ if st.session_state.stage == 'input':
     st.subheader("🧑‍🎨 주인공 외형 설정")
 
     avail = []
-    avail.append("✅ DeepFace" if DEEPFACE_AVAILABLE else "❌ DeepFace (pip install deepface tf-keras)")
-    avail.append("✅ CLIP" if CLIP_AVAILABLE else "❌ CLIP (pip install transformers torch)")
-    avail.append("✅ DINOv2" if DINO_AVAILABLE else "❌ DINOv2 (pip install transformers torch)")
+    avail.append("✅ DeepFace" if DEEPFACE_AVAILABLE else "❌ DeepFace")
+    avail.append("✅ CLIP" if CLIP_AVAILABLE else "❌ CLIP")
+    avail.append("✅ DINOv2" if DINO_AVAILABLE else "❌ DINOv2")
     st.info("검수 모델: " + " | ".join(avail))
 
     topic = st.text_input("주인공 외형/연출 의도",
@@ -327,16 +537,12 @@ if st.session_state.stage == 'input':
                               value=st.session_state.char_name,
                               placeholder="예: NOVA, MIRA, ZERO ...")
 
-    _, btn_col = st.columns([3, 1])
-    with btn_col:
-        clicked_generate_char = st.button("캐릭터 3면도 생성하기", use_container_width=True)
-    if clicked_generate_char:
+    if st.button("캐릭터 3면도 생성하기", use_container_width=True):
         if not topic.strip() or not char_name.strip():
             st.warning("모든 항목을 입력해 주세요.")
         else:
             st.session_state.topic = topic
             st.session_state.char_name = char_name.strip().upper()
-
             with st.spinner("외형 키워드 분석 중..."):
                 try:
                     resp = client.models.generate_content(
@@ -351,10 +557,26 @@ if st.session_state.stage == 'input':
                 try:
                     name = st.session_state.char_name
                     desc = st.session_state.char_description
+                    turnaround_prompt = (
+                        f"Professional character design turnaround sheet of {name}. "
+                        f"Character appearance: {desc}. "
+                        "THREE VIEWS side by side in a single image: "
+                        "LEFT: full-body FRONT VIEW facing camera directly. "
+                        "CENTER: full-body SIDE VIEW (90 degree profile, facing right). "
+                        "RIGHT: full-body BACK VIEW facing away from camera. "
+                        "All three views show the EXACT SAME character with identical costume, "
+                        "proportions, colors, and details. "
+                        "Pure solid white background. No shadows on background. "
+                        "Full body visible from head to toe in each view. "
+                        "Character centered and same height in all three panels. "
+                        "Clean separation between the three views. "
+                        "Hyperrealistic render, 8K resolution, professional studio lighting, "
+                        "flat even lighting to show all costume details clearly, "
+                        "concept art quality, character reference sheet style."
+                    )
                     result = client.models.generate_images(
                         model='imagen-4.0-generate-001',
-                        prompt=(f"Photorealistic 3-view turnaround of {name}: {desc}. "
-                                "Front/side/back on white background. 8K, studio lighting."),
+                        prompt=turnaround_prompt,
                         config=types.GenerateImagesConfig(
                             number_of_images=1, aspect_ratio="16:9",
                             person_generation="ALLOW_ADULT")
@@ -371,10 +593,9 @@ if st.session_state.stage == 'input':
 # ══════════════════════════════════════════════════════════════
 elif st.session_state.stage == 'character':
     name = st.session_state.char_name
-    desc = st.session_state.char_description
     st.subheader(f"🧑‍🎨 [{name}] 3면도 확인")
     st.image(st.session_state.character_image, caption=name)
-    st.caption(f"외형 키워드: {desc}")
+    st.caption(f"외형 키워드: {st.session_state.char_description}")
     st.info("확정하면 이후 모든 씬에서 이 외형이 유지됩니다.")
     col1, col2 = st.columns(2)
     with col1:
@@ -403,23 +624,49 @@ elif st.session_state.stage == 'scenario':
         placeholder="예: 버려진 공장에서 깨어난 마네킹이 자신이 플라스틱으로 만들어졌다는 사실을 깨닫고 인간이 되고자 탈출을 시도한다."
     )
 
-    _, btn_col = st.columns([3, 1])
-    with btn_col:
-        clicked_gen_scenario = st.button("🎬 시나리오 자동 생성", use_container_width=True)
-    if clicked_gen_scenario:
+    if st.button("🎬 시나리오 자동 생성", use_container_width=True):
         if not plot_input.strip():
             st.warning("줄거리를 입력해 주세요.")
         else:
-            # 1단계: 장르/속도감 → 씬 수 결정
+            # ── 1단계: 장르/속도감 분석 → 씬 수 + 예상 시간 결정 ──
             with st.spinner("장르 및 속도감 분석 중..."):
                 try:
                     plan_resp = client.models.generate_content(
                         model='gemini-2.5-flash',
                         contents=f"""
-Analyze this 5-minute film plot. Decide scene count per act (min 2, max 5).
-Return ONLY JSON:
-{{"genre":"...","pacing":"fast/medium/slow","reasoning":"한국어로 간단히","act1_scenes":N,"act2_scenes":N,"act3_scenes":N}}
-Plot: {plot_input}
+당신은 영화 편집 전문가입니다. 아래 5분(300초) 단편 영화 줄거리를 분석하세요.
+
+[분석 기준]
+- 장르별 평균 씬 지속시간:
+  * 액션/스릴러: 씬당 10~20초 (빠른 컷)
+  * 공포/서스펜스: 씬당 15~25초 (긴장 고조)
+  * 드라마/감성: 씬당 25~45초 (느린 호흡)
+  * SF/판타지: 씬당 20~35초 (세계관 설명 필요)
+  * 아트/실험: 씬당 30~60초 (관조적)
+
+- 3막 시간 배분 원칙:
+  * 1막(설정): 전체의 20~25%
+  * 2막(대립): 전체의 50~55%
+  * 3막(해결): 전체의 20~25%
+
+- 씬 수 범위: 막당 최소 2개, 최대 5개
+
+[출력 형식] 반드시 아래 JSON만 출력하세요. 다른 텍스트 없이:
+{{
+  "genre": "장르명",
+  "pacing": "fast/medium/slow",
+  "avg_scene_duration": 평균씬길이(초),
+  "total_duration_sec": 300,
+  "reasoning": "씬 수 결정 근거 (한국어, 2~3문장)",
+  "act1_scenes": N,
+  "act1_duration": 초,
+  "act2_scenes": N,
+  "act2_duration": 초,
+  "act3_scenes": N,
+  "act3_duration": 초
+}}
+
+줄거리: {plot_input}
 """
                     )
                     raw = plan_resp.text.strip().replace("```json","").replace("```","").strip()
@@ -430,48 +677,53 @@ Plot: {plot_input}
                     act3_n = int(act_plan.get("act3_scenes", 3))
                 except Exception as e:
                     st.warning(f"분석 실패, 기본값 사용: {e}")
-                    act1_n, act2_n, act3_n = 3, 3, 3
+                    act1_n, act2_n, act3_n = 2, 4, 2
                     st.session_state.act_plan = None
 
-            # 2단계: 시나리오 생성 (사용자 언어 — 한국어)
-            with st.spinner("시나리오 작성 중..."):
+            # ── 2단계: 씬 유형 분류 포함 시나리오 생성 ──────────────
+            with st.spinner("시나리오 + 씬 유형 분류 중..."):
                 try:
                     scene_resp = client.models.generate_content(
                         model='gemini-2.5-flash',
                         contents=f"""
-당신은 단편 영화 시나리오 작가입니다.
+당신은 단편 영화 시나리오 작가이자 콘티 감독입니다.
 주인공 이름: {name}, 외형: {desc}
 
-아래 줄거리를 3막 구조로 확장하고 각 막별 씬 묘사를 작성해주세요.
-- 1막(설정): {act1_n}개 씬
-- 2막(대립): {act2_n}개 씬
-- 3막(해결): {act3_n}개 씬
+아래 줄거리를 3막 구조로 확장하고 각 씬을 상세히 작성하세요.
 
-규칙:
-- 각 씬은 반드시 {name}을 언급해야 합니다
-- 한국어로 작성 (카메라 앵글, 조명, 액션 포함)
-- 반드시 아래 형식으로만 출력:
-1막_씬1: [묘사]
-1막_씬2: [묘사]
-...
-2막_씬1: [묘사]
-...
-3막_씬1: [묘사]
-...
+[씬 수 요구사항]
+- 1막(설정): 정확히 {act1_n}개 씬
+- 2막(대립): 정확히 {act2_n}개 씬
+- 3막(해결): 정확히 {act3_n}개 씬
+
+[각 씬 작성 기준]
+- 씬 묘사: 카메라 앵글, 조명, {name}의 행동과 감정, 배경을 구체적으로 기술 (2~3문장)
+- 씬 유형 분류:
+  * face_visible: {name}의 얼굴이 명확히 보이는 씬 (정면, 클로즈업, 미디엄샷)
+  * face_hidden: 뒷모습, 원거리, 측면 등 얼굴이 안 보이거나 부분적으로 보이는 씬
+  * crowd: 군중 속 씬 또는 {name}이 작게 등장하는 와이드샷
+- 카메라: close-up / medium / wide / over-shoulder / aerial 중 선택
+- 예상 지속시간(초): 씬의 호흡에 맞게 설정
+
+[출력 형식] 반드시 아래 JSON 배열만 출력하세요. 다른 텍스트 없이:
+[
+  {{"act":"1막","text":"1막_씬1: [한국어 씬 묘사]","type":"face_visible","camera":"medium","duration":25,"reason":"캐릭터 첫 등장, 얼굴 인식 필요"}},
+  {{"act":"1막","text":"1막_씬2: [한국어 씬 묘사]","type":"face_hidden","camera":"wide","duration":30,"reason":"공간 설명 씬"}},
+  ...
+]
 
 줄거리: {plot_input}
 """
                     )
-                    raw_lines = scene_resp.text.strip().split('\n')
-                    scenes_by_act = {"1막": [], "2막": [], "3막": []}
-                    act_map = {"1막": "1막", "2막": "2막", "3막": "3막"}
+                    raw = scene_resp.text.strip().replace("```json","").replace("```","").strip()
+                    scenes_flat = json.loads(raw)
 
-                    for line in raw_lines:
-                        line = line.strip()
-                        for prefix, act_kr in act_map.items():
-                            if line.startswith(prefix):
-                                scenes_by_act[act_kr].append(line)
-                                break
+                    # act별로 그룹핑
+                    scenes_by_act = {"1막": [], "2막": [], "3막": []}
+                    for s in scenes_flat:
+                        act = s.get("act", "1막")
+                        if act in scenes_by_act:
+                            scenes_by_act[act].append(s)
 
                     st.session_state.scenes_by_act = scenes_by_act
                     st.rerun()
@@ -479,21 +731,26 @@ Plot: {plot_input}
                 except Exception as e:
                     st.error(f"시나리오 생성 오류: {e}")
 
-    # 생성된 시나리오가 있으면 표시 + 수정
+    # ── 생성된 시나리오 표시 + 수정 ────────────────────────────
     if st.session_state.scenes_by_act:
         plan = st.session_state.act_plan
+        total_scenes = sum(len(v) for v in st.session_state.scenes_by_act.values())
+
         if plan:
-            st.success(
-                f"장르: **{plan.get('genre')}** | 속도감: **{plan.get('pacing')}** | "
-                f"총 {sum(len(v) for v in st.session_state.scenes_by_act.values())}컷"
-            )
-            st.caption(f"결정 근거: {plan.get('reasoning')}")
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("장르", plan.get('genre', 'N/A'))
+            col2.metric("속도감", plan.get('pacing', 'N/A'))
+            col3.metric("총 씬 수", f"{total_scenes}컷")
+            col4.metric("평균 씬 길이", f"{plan.get('avg_scene_duration', 'N/A')}초")
+            st.caption(f"📌 {plan.get('reasoning', '')}")
 
         st.markdown("### 📖 생성된 시나리오 — 직접 수정 가능합니다")
-        st.info("💡 각 씬의 내용을 자유롭게 수정한 뒤 '이 시나리오로 확정' 버튼을 누르세요.")
+        st.info("💡 씬 내용을 수정하고 유형/카메라도 변경할 수 있습니다. 확정 후 샘플 테스트로 넘어갑니다.")
 
         ACT_EMOJI = {"1막": "🌅", "2막": "⚡", "3막": "🌟"}
-        ACT_DESC = {"1막": "설정", "2막": "대립", "3막": "해결"}
+        ACT_DESC  = {"1막": "설정", "2막": "대립", "3막": "해결"}
+        TYPE_OPTIONS = ["face_visible", "face_hidden", "crowd"]
+        CAMERA_OPTIONS = ["close-up", "medium", "wide", "over-shoulder", "aerial"]
 
         edited_scenes = {"1막": [], "2막": [], "3막": []}
 
@@ -501,31 +758,74 @@ Plot: {plot_input}
             scenes_list = st.session_state.scenes_by_act.get(act_kr, [])
             if not scenes_list:
                 continue
-            st.markdown(f"#### {ACT_EMOJI[act_kr]} {act_kr} — {ACT_DESC[act_kr]}")
-            for j, scene_text in enumerate(scenes_list):
-                edited = st.text_area(
-                    f"{act_kr} {j+1}번째 씬",
-                    value=scene_text,
-                    key=f"scene_{act_kr}_{j}",
-                    height=80
-                )
-                edited_scenes[act_kr].append(edited)
 
-        st.divider()
+            act_dur = sum(s.get("duration", 0) for s in scenes_list)
+            st.markdown(f"#### {ACT_EMOJI[act_kr]} {act_kr} — {ACT_DESC[act_kr]} ({len(scenes_list)}컷 / 약 {act_dur}초)")
+
+            for j, scene_info in enumerate(scenes_list):
+                with st.container(border=True):
+                    c1, c2, c3 = st.columns([5, 2, 2])
+                    with c1:
+                        edited_text = st.text_area(
+                            f"{act_kr} 씬{j+1}",
+                            value=scene_info.get("text", ""),
+                            key=f"text_{act_kr}_{j}",
+                            height=90
+                        )
+                    with c2:
+                        edited_type = st.selectbox(
+                            "씬 유형",
+                            TYPE_OPTIONS,
+                            index=TYPE_OPTIONS.index(scene_info.get("type", "face_visible")),
+                            key=f"type_{act_kr}_{j}",
+                            format_func=lambda x: f"{SCENE_TYPE_CONFIG[x]['emoji']} {SCENE_TYPE_CONFIG[x]['label']}"
+                        )
+                        edited_camera = st.selectbox(
+                            "카메라",
+                            CAMERA_OPTIONS,
+                            index=CAMERA_OPTIONS.index(scene_info.get("camera", "medium"))
+                            if scene_info.get("camera") in CAMERA_OPTIONS else 0,
+                            key=f"camera_{act_kr}_{j}"
+                        )
+                    with c3:
+                        edited_dur = st.number_input(
+                            "지속시간(초)",
+                            min_value=5, max_value=120,
+                            value=int(scene_info.get("duration", 20)),
+                            key=f"dur_{act_kr}_{j}"
+                        )
+                        cfg = SCENE_TYPE_CONFIG.get(edited_type, {})
+                        st.caption(
+                            f"적용 모델:\n"
+                            f"{'✅' if cfg.get('use_deepface') else '⬜'} DeepFace\n"
+                            f"{'✅' if cfg.get('use_clip') else '⬜'} CLIP\n"
+                            f"{'✅' if cfg.get('use_dino') else '⬜'} DINOv2"
+                        )
+
+                    edited_scenes[act_kr].append({
+                        "text": edited_text,
+                        "type": edited_type,
+                        "camera": edited_camera,
+                        "duration": edited_dur,
+                        "reason": scene_info.get("reason", ""),
+                    })
+
+            st.divider()
+
         col1, col2 = st.columns(2)
         with col1:
             if st.button("🔄 시나리오 다시 생성", use_container_width=True):
                 st.session_state.scenes_by_act = None
                 st.rerun()
         with col2:
-            if st.button("✅ 이 시나리오로 확정 → 샘플 테스트", use_container_width=True):
+            if st.button("✅ 확정 → 샘플 테스트", use_container_width=True):
                 st.session_state.scenes_by_act = edited_scenes
                 st.session_state.stage = 'sample'
                 st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════
-# [단계 3] 샘플 테스트 (각 막 1컷씩 = 3컷)
+# [단계 3] 샘플 테스트
 # ══════════════════════════════════════════════════════════════
 elif st.session_state.stage == 'sample':
     name = st.session_state.char_name
@@ -534,39 +834,34 @@ elif st.session_state.stage == 'sample':
     ref_bytes = st.session_state.character_image
 
     st.subheader("🧪 샘플 테스트 (각 막 첫 번째 씬)")
-    st.info("전체 생성 전에 각 막의 첫 번째 씬만 먼저 생성해서 검수 설정을 확인합니다.")
+    st.info("전체 생성 전에 각 막 첫 씬만 먼저 생성해서 검수 설정을 확인합니다.")
 
-    # 검수 설정
     with st.expander("⚙️ 검수 설정", expanded=True):
         check_method = st.radio(
-            "재생성 판정 기준",
+            "재생성 판정 기준 (씬 유형이 face_hidden/crowd이면 자동 override됩니다)",
             ["A: DeepFace + CLIP", "B: DINOv2"],
             index=0 if st.session_state.check_method.startswith("A") else 1,
             horizontal=True
         )
         col1, col2, col3 = st.columns(3)
         with col1:
-            df_thr = st.slider("DeepFace 기준점", 30, 90,
-                               st.session_state.df_threshold, 5)
+            df_thr = st.slider("DeepFace 기준점", 30, 90, st.session_state.df_threshold, 5,
+                               help="face_visible 씬에만 적용")
         with col2:
-            clip_thr = st.slider("CLIP 기준점", 30, 90,
-                                 st.session_state.clip_threshold, 5)
+            clip_thr = st.slider("CLIP 기준점", 30, 90, st.session_state.clip_threshold, 5,
+                                 help="face_visible + face_hidden 씬에 적용")
         with col3:
-            dino_thr = st.slider("DINOv2 기준점", 30, 90,
-                                 st.session_state.dino_threshold, 5)
+            dino_thr = st.slider("DINOv2 기준점", 30, 90, st.session_state.dino_threshold, 5,
+                                 help="face_hidden + crowd 씬에 적용")
         max_retries = st.slider("최대 재시도", 1, 5, st.session_state.max_retries)
 
-        # 설정 세션 저장
         st.session_state.check_method = check_method
         st.session_state.df_threshold = df_thr
         st.session_state.clip_threshold = clip_thr
         st.session_state.dino_threshold = dino_thr
         st.session_state.max_retries = max_retries
 
-    _, btn_col = st.columns([3, 1])
-    with btn_col:
-        clicked_gen_sample = st.button("🧪 샘플 3컷 생성", use_container_width=True)
-    if clicked_gen_sample:
+    if st.button("🧪 샘플 3컷 생성", use_container_width=True):
         sample_data = []
         progress = st.progress(0)
 
@@ -574,27 +869,25 @@ elif st.session_state.stage == 'sample':
             scenes_list = scenes_by_act.get(act_kr, [])
             if not scenes_list:
                 continue
-
-            # 각 막의 첫 번째 씬만 사용
-            sample_scene = scenes_list[0]
+            sample_scene_info = scenes_list[0]
             label = f"{act_kr} 샘플"
             status_box = st.empty()
 
             result = generate_and_check(
-                name, desc, sample_scene, ref_bytes,
+                name, desc, sample_scene_info, ref_bytes,
                 check_method, df_thr, clip_thr, dino_thr, max_retries,
                 label, status_box
             )
             result["act"] = act_kr
             result["cut_num"] = 1
-            result["desc"] = sample_scene
+            result["desc"] = sample_scene_info.get("text", "")
+            result["scene_info"] = sample_scene_info
             sample_data.append(result)
             progress.progress((act_i + 1) / 3)
 
         st.session_state.sample_data = sample_data
         st.rerun()
 
-    # 샘플 결과 표시
     if st.session_state.sample_data:
         st.markdown("### 🖼️ 샘플 결과")
         cols = st.columns(3)
@@ -602,33 +895,35 @@ elif st.session_state.stage == 'sample':
             with cols[i]:
                 act_kr = sample.get("act", f"{i+1}막")
                 scores = sample.get("best_scores", {})
+                scene_type = sample.get("scene_type", "face_visible")
+                cfg = SCENE_TYPE_CONFIG.get(scene_type, {})
+
                 st.image(sample["image_bytes"], caption=f"{act_kr} 샘플")
-                st.caption(score_badge(scores.get("deepface", -1), "DeepFace", df_thr))
-                st.caption(score_badge(scores.get("clip", -1), "CLIP", clip_thr))
-                st.caption(score_badge(scores.get("dino", -1), "DINOv2", dino_thr))
+                st.caption(f"{cfg.get('emoji','')} {cfg.get('label', scene_type)}")
+                st.caption(score_badge(scores.get("deepface",-1), "DeepFace", df_thr, cfg.get("use_deepface",True)))
+                st.caption(score_badge(scores.get("clip",-1), "CLIP", clip_thr, cfg.get("use_clip",True)))
+                st.caption(score_badge(scores.get("dino",-1), "DINOv2", dino_thr, cfg.get("use_dino",False)))
                 st.caption("✅ 통과" if sample.get("passed") else "⚠️ 최고점 채택")
 
-                failed = [a for a in sample.get("all_attempts", []) if not a["passed"]]
+                failed = [a for a in sample.get("all_attempts",[]) if not a["passed"]]
                 if failed:
                     with st.expander(f"🔬 탈락 {len(failed)}장"):
                         st.image(ref_bytes, width=150, caption="레퍼런스")
-                        for a in sample.get("all_attempts", []):
+                        for a in sample.get("all_attempts",[]):
                             ch = a["check"]
-                            sc_tag = " 🔧SC" if a.get("self_corrected") else ""
-                            status = "🟢 통과" if a["passed"] else "🔴 탈락"
+                            sc_tag = f" 🔧{a.get('strategy','')}" if a.get("self_corrected") else ""
                             st.image(a["image_bytes"],
-                                     caption=f"{a['attempt']}차{sc_tag} | {status}",
+                                     caption=f"{a['attempt']}차{sc_tag} | {'🟢통과' if a['passed'] else '🔴탈락'}",
                                      use_container_width=True)
                             st.caption(
-                                f"DeepFace: {ch.get('deepface_score',-1)}점 | "
-                                f"CLIP: {ch.get('clip_score',-1)}점 | "
-                                f"DINOv2: {ch.get('dino_score',-1)}점"
+                                f"DeepFace:{ch.get('deepface_score',-1)} | "
+                                f"CLIP:{ch.get('clip_score',-1)} | "
+                                f"DINOv2:{ch.get('dino_score',-1)}"
                             )
                             if a.get("fail_reason"):
                                 st.caption(f"탈락: {a['fail_reason']}")
 
         st.divider()
-        st.markdown("**샘플이 만족스러우신가요?**")
         col1, col2, col3 = st.columns(3)
         with col1:
             if st.button("📝 시나리오부터 다시", use_container_width=True):
@@ -636,7 +931,7 @@ elif st.session_state.stage == 'sample':
                 st.session_state.sample_data = []
                 st.rerun()
         with col2:
-            if st.button("🔧 설정 바꾸고 샘플 재생성", use_container_width=True):
+            if st.button("🔧 설정 변경 후 재생성", use_container_width=True):
                 st.session_state.sample_data = []
                 st.rerun()
         with col3:
@@ -647,44 +942,43 @@ elif st.session_state.stage == 'sample':
 
 
 # ══════════════════════════════════════════════════════════════
-# [단계 4] 전체 스토리보드 생성
+# [단계 4] 전체 스토리보드 생성 + 결과
 # ══════════════════════════════════════════════════════════════
 elif st.session_state.stage == 'storyboard':
     name = st.session_state.char_name
     desc = st.session_state.char_description
     scenes_by_act = st.session_state.scenes_by_act
     ref_bytes = st.session_state.character_image
-
     check_method = st.session_state.check_method
-    df_thr = st.session_state.df_threshold
+    df_thr  = st.session_state.df_threshold
     clip_thr = st.session_state.clip_threshold
     dino_thr = st.session_state.dino_threshold
     max_retries = st.session_state.max_retries
 
-    # 아직 생성 안 됐으면 생성 시작
+    # ── 아직 생성 안 됐으면 생성 시작 ─────────────────────────
     if not st.session_state.storyboard_data:
         st.subheader(f"🎬 [{name}] 전체 스토리보드 생성 중...")
-        st.caption(f"검수 방식: {check_method} | 재시도: {max_retries}회")
+        st.caption(f"기본 판정 방식: {check_method} | 재시도: {max_retries}회 | 씬 유형별 자동 override 적용")
 
         total_scenes = sum(len(v) for v in scenes_by_act.values())
         progress_bar = st.progress(0)
         scene_counter = 0
 
         for act_kr in ["1막", "2막", "3막"]:
-            scenes_list = scenes_by_act.get(act_kr, [])
-            for cut_idx, scene_text in enumerate(scenes_list):
+            for cut_idx, scene_info in enumerate(scenes_by_act.get(act_kr, [])):
                 cut_num = cut_idx + 1
                 label = f"{act_kr} {cut_num}컷"
                 status_box = st.empty()
 
                 result = generate_and_check(
-                    name, desc, scene_text, ref_bytes,
+                    name, desc, scene_info, ref_bytes,
                     check_method, df_thr, clip_thr, dino_thr, max_retries,
                     label, status_box
                 )
                 result["act"] = act_kr
                 result["cut_num"] = cut_num
-                result["desc"] = scene_text
+                result["desc"] = scene_info.get("text", "")
+                result["scene_info"] = scene_info
                 st.session_state.storyboard_data.append(result)
 
                 scene_counter += 1
@@ -694,53 +988,57 @@ elif st.session_state.stage == 'storyboard':
 
     # ── 생성 완료 — 결과 표시 ──────────────────────────────────
     else:
-        st.subheader(f"🎞️ [{name}]의 완성 스토리보드")
-
         plan = st.session_state.act_plan
+        st.subheader(f"🎞️ [{name}]의 완성 스토리보드")
         if plan:
             st.info(
                 f"🎬 장르: **{plan.get('genre')}** | 속도감: **{plan.get('pacing')}** | "
-                f"총 {len(st.session_state.storyboard_data)}컷"
+                f"총 {len(st.session_state.storyboard_data)}컷 | "
+                f"평균 씬 길이: {plan.get('avg_scene_duration','N/A')}초"
             )
 
-        ACT_CONFIG = [
-            ("1막", "설정", "🌅"), ("2막", "대립", "⚡"), ("3막", "해결", "🌟")
-        ]
+        ACT_CONFIG = [("1막","설정","🌅"), ("2막","대립","⚡"), ("3막","해결","🌟")]
 
         for act_kr, act_desc_kr, emoji in ACT_CONFIG:
             act_scenes = [s for s in st.session_state.storyboard_data if s.get("act") == act_kr]
             if not act_scenes:
                 continue
 
-            st.markdown(f"#### {emoji} {act_kr} — {act_desc_kr}")
+            act_dur = sum(s.get("scene_info",{}).get("duration",0) for s in act_scenes)
+            st.markdown(f"#### {emoji} {act_kr} — {act_desc_kr} (약 {act_dur}초)")
             cols = st.columns(len(act_scenes))
 
             for col_i, scene in enumerate(act_scenes):
                 with cols[col_i]:
                     scores = scene.get("best_scores", {})
-                    st.image(scene["image_bytes"], caption=f"{act_kr} {scene['cut_num']}컷")
-                    st.caption(score_badge(scores.get("deepface", -1), "DeepFace", df_thr))
-                    st.caption(score_badge(scores.get("clip", -1), "CLIP", clip_thr))
-                    st.caption(score_badge(scores.get("dino", -1), "DINOv2", dino_thr))
-                    st.caption("✅ 통과" if scene.get("passed") else "⚠️ 최고점 채택")
-                    st.caption(scene['desc'][:50] + "...")
+                    scene_type = scene.get("scene_type", "face_visible")
+                    cfg = SCENE_TYPE_CONFIG.get(scene_type, {})
+                    si = scene.get("scene_info", {})
 
-                    failed = [a for a in scene.get("all_attempts", []) if not a["passed"]]
+                    st.image(scene["image_bytes"],
+                             caption=f"{act_kr} {scene['cut_num']}컷")
+                    st.caption(f"{cfg.get('emoji','')} {cfg.get('label', scene_type)} | {si.get('camera','')} | {si.get('duration',0)}초")
+                    st.caption(score_badge(scores.get("deepface",-1), "DeepFace", df_thr, cfg.get("use_deepface",True)))
+                    st.caption(score_badge(scores.get("clip",-1), "CLIP", clip_thr, cfg.get("use_clip",True)))
+                    st.caption(score_badge(scores.get("dino",-1), "DINOv2", dino_thr, cfg.get("use_dino",False)))
+                    st.caption("✅ 통과" if scene.get("passed") else "⚠️ 최고점 채택")
+                    st.caption(scene['desc'][:45] + "...")
+
+                    failed = [a for a in scene.get("all_attempts",[]) if not a["passed"]]
                     if failed:
                         with st.expander(f"🔬 탈락 {len(failed)}장"):
-                            st.image(ref_bytes, width=150, caption="레퍼런스")
+                            st.image(ref_bytes, width=140, caption="레퍼런스")
                             st.divider()
-                            for a in scene.get("all_attempts", []):
+                            for a in scene.get("all_attempts",[]):
                                 ch = a["check"]
-                                sc_tag = " 🔧SC" if a.get("self_corrected") else ""
-                                status = "🟢 통과" if a["passed"] else "🔴 탈락"
+                                sc_tag = f" 🔧{a.get('strategy','')}" if a.get("self_corrected") else ""
                                 st.image(a["image_bytes"],
-                                         caption=f"{a['attempt']}차{sc_tag} | {status}",
+                                         caption=f"{a['attempt']}차{sc_tag} | {'🟢통과' if a['passed'] else '🔴탈락'}",
                                          use_container_width=True)
                                 st.caption(
-                                    f"DeepFace: {ch.get('deepface_score',-1)}점 | "
-                                    f"CLIP: {ch.get('clip_score',-1)}점 | "
-                                    f"DINOv2: {ch.get('dino_score',-1)}점"
+                                    f"DeepFace:{ch.get('deepface_score',-1)} | "
+                                    f"CLIP:{ch.get('clip_score',-1)} | "
+                                    f"DINOv2:{ch.get('dino_score',-1)}"
                                 )
                                 if a.get("fail_reason"):
                                     st.caption(f"탈락: {a['fail_reason']}")
@@ -748,26 +1046,40 @@ elif st.session_state.stage == 'storyboard':
 
             st.divider()
 
-        # ── 하단 버튼 ──────────────────────────────────────────
-        col1, col2, col3 = st.columns(3)
+        # ── 하단 저장 버튼 ──────────────────────────────────────
+        st.markdown("### 💾 저장")
+        col1, col2, col3, col4 = st.columns(4)
+
         with col1:
-            # 전체 이미지 ZIP 다운로드
-            zip_data = make_zip(st.session_state.storyboard_data)
+            zip_data = make_image_zip(st.session_state.storyboard_data)
             st.download_button(
-                label="💾 전체 이미지 저장 (ZIP)",
+                label="🖼️ 이미지 전체 저장 (ZIP)",
                 data=zip_data,
                 file_name=f"{name}_storyboard.zip",
                 mime="application/zip",
                 use_container_width=True
             )
         with col2:
+            txt_data = make_scenario_txt(
+                name,
+                st.session_state.act_plan,
+                st.session_state.scenes_by_act,
+                st.session_state.storyboard_data
+            )
+            st.download_button(
+                label="📄 시나리오 저장 (TXT)",
+                data=txt_data.encode("utf-8"),
+                file_name=f"{name}_scenario.txt",
+                mime="text/plain",
+                use_container_width=True
+            )
+        with col3:
             if st.button("🔧 샘플 설정으로 돌아가기", use_container_width=True):
                 st.session_state.stage = 'sample'
                 st.session_state.storyboard_data = []
                 st.rerun()
-        with col3:
+        with col4:
             if st.button("🔄 처음부터 다시", use_container_width=True):
-                for key in ['stage', 'character_image', 'storyboard_data', 'sample_data',
-                            'topic', 'char_name', 'char_description', 'act_plan', 'scenes_by_act']:
+                for key in defaults:
                     st.session_state[key] = defaults[key]
                 st.rerun()
