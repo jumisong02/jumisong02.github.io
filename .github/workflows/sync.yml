@@ -1,0 +1,23 @@
+name: Sync to Hugging Face hub
+
+on:
+  push:
+    branches: [main] # main 브랜치에 푸시될 때마다 실행
+  force_push: true # 강제 푸시 대응 (선택 사항)
+
+jobs:
+  sync-to-hub:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          lfs: true # 대용량 파일(LFS)이 있다면 true로 설정
+
+      - name: Push to hub
+        env:
+          HF_TOKEN: ${{ secrets.HUGGING_FACE }}
+        run: |
+          # 허깅페이스 저장소 주소를 본인 것으로 수정하세요. 
+          # 예: https://huggingface.co/spaces/사용자ID/저장소이름
+          git push --force https://huggingface.co/spaces/sojumcoding/StoryboardGen 
