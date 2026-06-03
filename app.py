@@ -10,6 +10,8 @@ import io
 from google import genai
 from google.genai import types
 
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 # ── 라이브러리 임포트 ──────────────────────────────────────────
 try:
     from deepface import DeepFace
@@ -18,20 +20,17 @@ except ImportError:
     DEEPFACE_AVAILABLE = False
 
 try:
+    import open_clip
     import torch
-    from transformers import CLIPProcessor, CLIPModel
-    from PIL import Image as PILImage
+    from PIL import Image
+    import torch.nn.functional as F
     CLIP_AVAILABLE = True
 except ImportError:
     CLIP_AVAILABLE = False
 
-try:
-    import torch
-    from transformers import AutoProcessor, AutoModel
-    from PIL import Image as PILImage
-    DINO_AVAILABLE = True
-except ImportError:
-    DINO_AVAILABLE = False
+# tokenizer는 CLIP 로딩 후 별도 보관
+_clip_tokenizer = None
+
 
 # ── API 클라이언트 ─────────────────────────────────────────────
 client = genai.Client(
@@ -49,10 +48,9 @@ defaults = {
     'char_description': '',
     'act_plan': None,
     'scenes_by_act': None,      # {act: [{text, type, camera, duration, reason}]}
-    'check_method': 'A: DeepFace + CLIP',
-    'df_threshold': 60,
-    'clip_threshold': 60,
-    'dino_threshold': 60,
+    'df_threshold': 70,  # Facenet512 cosine 공식 기준 (distance<0.30 ↔ score>70)
+    'clip_threshold': 50,       # image-image cosine 정규화: (cosine-0.5)/0.5×100
+    'clip_text_threshold': 25,  # text-image cosine 정규화: 낮은 기준 (분포 상이)
     'max_retries': 3,
 }
 for k, v in defaults.items():
@@ -75,17 +73,13 @@ st.divider()
 # ══════════════════════════════════════════════════════════════
 @st.cache_resource
 def load_clip_model():
-    from transformers import CLIPProcessor, CLIPModel
-    model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
-    processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
-    return model, processor
+    model, _, preprocess = open_clip.create_model_and_transforms(
+        'ViT-B-32',
+        pretrained='openai'
+    )
+    tokenizer = open_clip.get_tokenizer('ViT-B-32')
+    return model, preprocess, tokenizer
 
-@st.cache_resource
-def load_dino_model():
-    from transformers import AutoProcessor, AutoModel
-    model = AutoModel.from_pretrained("facebook/dinov2-base")
-    processor = AutoProcessor.from_pretrained("facebook/dinov2-base")
-    return model, processor
 
 def bytes_to_pil(img_bytes):
     from PIL import Image as PILImage
@@ -101,24 +95,26 @@ SCENE_TYPE_CONFIG = {
         "emoji": "👤",
         "use_deepface": True,
         "use_clip": True,
-        "use_dino": False,
-        "correction_strategy": "face_focus",  # 얼굴 크게, 정면
+        "use_clip_text": False,
+        "correction_strategy": "face_focus",
     },
+
     "face_hidden": {
         "label": "얼굴 미노출",
         "emoji": "🎭",
         "use_deepface": False,
         "use_clip": True,
-        "use_dino": True,
-        "correction_strategy": "body_focus",  # 의상/체형 강조
+        "use_clip_text": True,
+        "correction_strategy": "body_focus",
     },
+
     "crowd": {
         "label": "군중씬",
         "emoji": "👥",
         "use_deepface": False,
         "use_clip": False,
-        "use_dino": True,
-        "correction_strategy": "composition_focus",  # 전체 구성
+        "use_clip_text": True,
+        "correction_strategy": "composition_focus",
     },
 }
 
@@ -154,100 +150,140 @@ def check_deepface(ref_bytes, gen_bytes):
             except: pass
     return result
 
-def check_clip(ref_bytes, gen_bytes):
-    result = {"clip_score": -1, "clip_reason": "미실행"}
+def check_clip_image(ref_bytes, gen_bytes):
+    """CLIP image-image 유사도 (캐릭터 외형 일관성)"""
+    result = {
+        "clip_score": -1,
+        "clip_passed": False,
+        "clip_reason": "미실행"
+    }
     if not CLIP_AVAILABLE:
         result["clip_reason"] = "미설치"
         return result
     try:
-        clip_model, clip_proc = load_clip_model()
-        inputs = clip_proc(images=[bytes_to_pil(ref_bytes), bytes_to_pil(gen_bytes)],
-                           return_tensors="pt", padding=True)
+        model, preprocess, _ = load_clip_model()
+        device = "cpu"
+        model = model.to(device)
+
+        img1 = Image.open(io.BytesIO(ref_bytes)).convert("RGB")
+        img2 = Image.open(io.BytesIO(gen_bytes)).convert("RGB")
+        img1 = preprocess(img1).unsqueeze(0).to(device)
+        img2 = preprocess(img2).unsqueeze(0).to(device)
+
         with torch.no_grad():
-            feats = clip_model.get_image_features(**inputs)
-        feats = feats / feats.norm(dim=-1, keepdim=True)
-        sim = (feats[0] @ feats[1]).item()
-        score = round(max(0.0, sim) * 100, 1)
+            feat1 = model.encode_image(img1)
+            feat2 = model.encode_image(img2)
+
+        feat1 = F.normalize(feat1, dim=-1)
+        feat2 = F.normalize(feat2, dim=-1)
+        sim = (feat1 @ feat2.T).item()
+        score = round(sim * 100, 1)
+
         result["clip_score"] = score
-        result["clip_reason"] = f"{score}점 (cosine={sim:.3f})"
+        result["clip_passed"] = True
+        result["clip_reason"] = f"{score}점"
     except Exception as e:
-        result["clip_reason"] = f"오류: {e}"
+        result["clip_reason"] = str(e)
     return result
 
-def check_dino(ref_bytes, gen_bytes):
-    result = {"dino_score": -1, "dino_reason": "미실행"}
-    if not DINO_AVAILABLE:
-        result["dino_reason"] = "미설치"
+
+def check_clip_text(gen_bytes, scene_text):
+    """CLIP text-image 유사도 (씬 묘사 부합도)"""
+    result = {
+        "clip_text_score": -1,
+        "clip_text_passed": False,
+        "clip_text_reason": "미실행"
+    }
+    if not CLIP_AVAILABLE:
+        result["clip_text_reason"] = "미설치"
         return result
     try:
-        dino_model, dino_proc = load_dino_model()
-        inputs = dino_proc(images=[bytes_to_pil(ref_bytes), bytes_to_pil(gen_bytes)],
-                           return_tensors="pt")
+        model, preprocess, tokenizer = load_clip_model()
+        device = "cpu"
+        model = model.to(device)
+
+        img = Image.open(io.BytesIO(gen_bytes)).convert("RGB")
+        img_tensor = preprocess(img).unsqueeze(0).to(device)
+
+        # 씬 텍스트 토크나이즈 (512 토큰 초과 방지 위해 앞 77토큰만 사용)
+        text_tokens = tokenizer([scene_text[:200]]).to(device)
+
         with torch.no_grad():
-            outputs = dino_model(**inputs)
-        feats = outputs.last_hidden_state[:, 0, :]
-        feats = feats / feats.norm(dim=-1, keepdim=True)
-        sim = (feats[0] @ feats[1]).item()
-        score = round(max(0.0, sim) * 100, 1)
-        result["dino_score"] = score
-        result["dino_reason"] = f"{score}점 (cosine={sim:.3f})"
+            img_feat = model.encode_image(img_tensor)
+            txt_feat = model.encode_text(text_tokens)
+
+        img_feat = F.normalize(img_feat, dim=-1)
+        txt_feat = F.normalize(txt_feat, dim=-1)
+        sim = (img_feat @ txt_feat.T).item()
+        # text-image cosine은 보통 0.1~0.35 범위 → 0~100 정규화 (0.0→0, 0.5→100)
+        score = round(max(0.0, sim * 200), 1)
+
+        result["clip_text_score"] = score
+        result["clip_text_passed"] = True
+        result["clip_text_reason"] = f"{score}점 (cosine={sim:.3f})"
     except Exception as e:
-        result["dino_reason"] = f"오류: {e}"
+        result["clip_text_reason"] = str(e)
     return result
 
 
-def run_adaptive_check(ref_bytes, gen_bytes, scene_type,
-                       check_method, df_thr, clip_thr, dino_thr):
+def run_adaptive_check(ref_bytes, gen_bytes, scene_text, scene_type,
+                       df_thr, clip_thr, clip_text_thr):
     """
     씬 유형에 따라 적용할 모델을 결정하고 통과 여부 판정.
-    check_method는 씬 유형이 override하지 않는 경우의 기본값.
+    - face_visible : DeepFace + CLIP image-image
+    - face_hidden  : CLIP image-image + CLIP text-image
+    - crowd        : CLIP text-image 전용
     """
     cfg = SCENE_TYPE_CONFIG.get(scene_type, SCENE_TYPE_CONFIG["face_visible"])
 
-    # 항상 세 모델 모두 실행 (비교 데이터 수집)
     df_result  = check_deepface(ref_bytes, gen_bytes)
-    cl_result  = check_clip(ref_bytes, gen_bytes)
-    di_result  = check_dino(ref_bytes, gen_bytes)
+    cl_result  = check_clip_image(ref_bytes, gen_bytes)
+    ct_result  = check_clip_text(gen_bytes, scene_text)
 
-    df_s = df_result["deepface_score"]
-    cl_s = cl_result["clip_score"]
-    di_s = di_result["dino_score"]
+    df_s  = df_result["deepface_score"]
+    cl_s  = cl_result["clip_score"]
+    ct_s  = ct_result["clip_text_score"]
 
-    # 씬 유형별 통과 판정
     conditions = []
     fail_reasons = []
 
     if cfg["use_deepface"]:
-        df_ok = df_result["deepface_passed"] and (df_s == -1 or df_s >= df_thr)
+        df_ok = (df_s == -1 or df_s >= df_thr)
         conditions.append(df_ok)
-        if df_s != -1 and not df_result["deepface_passed"]:
-            fail_reasons.append(f"DeepFace 기준 미달 ({df_s}점)")
-        elif df_s != -1 and not df_ok:
-            fail_reasons.append(f"DeepFace 슬라이더 미달 ({df_s}점 < {df_thr}점)")
+        if df_s != -1 and not df_ok:
+            fail_reasons.append(f"DeepFace 미달 ({df_s}점 < {df_thr}점)")
 
     if cfg["use_clip"]:
         cl_ok = (cl_s == -1 or cl_s >= clip_thr)
         conditions.append(cl_ok)
         if cl_s != -1 and not cl_ok:
-            fail_reasons.append(f"CLIP 미달 ({cl_s}점 < {clip_thr}점)")
+            fail_reasons.append(f"CLIP image 미달 ({cl_s}점 < {clip_thr}점)")
 
-    if cfg["use_dino"]:
-        di_ok = (di_s == -1 or di_s >= dino_thr)
-        conditions.append(di_ok)
-        if di_s != -1 and not di_ok:
-            fail_reasons.append(f"DINOv2 미달 ({di_s}점 < {dino_thr}점)")
+    if cfg["use_clip_text"]:
+        ct_ok = (ct_s == -1 or ct_s >= clip_text_thr)
+        conditions.append(ct_ok)
+        if ct_s != -1 and not ct_ok:
+            fail_reasons.append(f"CLIP text 미달 ({ct_s}점 < {clip_text_thr}점)")
 
     overall = all(conditions) if conditions else True
     fail = " | ".join(fail_reasons) if fail_reasons else None
 
+    active_models = []
+    if cfg["use_deepface"]:    active_models.append("deepface")
+    if cfg["use_clip"]:        active_models.append("clip")
+    if cfg["use_clip_text"]:   active_models.append("clip_text")
+
     return {
-        **df_result, **cl_result, **di_result,
+        **df_result, **cl_result, **ct_result,
         "overall_passed": overall,
         "fail_reason": fail,
         "scene_type": scene_type,
-        "active_models": [k for k in ["deepface","clip","dino"]
-                          if cfg.get(f"use_{k}", False)],
+        "active_models": active_models,
     }
+
+    df_s = df_result["deepface_score"]
+    cl_s = cl_result["clip_score"]
+
 
 
 # ══════════════════════════════════════════════════════════════
@@ -331,7 +367,7 @@ def generate_image(name, desc, scene_text, scene_type, ref_bytes, prev_score=-1,
 # [헬퍼] 씬 1개 생성 + 적응형 검수 루프
 # ══════════════════════════════════════════════════════════════
 def generate_and_check(name, desc, scene_info, ref_bytes,
-                       check_method, df_thr, clip_thr, dino_thr, max_retries,
+                       df_thr, clip_thr, clip_text_thr, max_retries,
                        label, status_box):
     scene_text = scene_info.get("text", "")
     scene_type = scene_info.get("type", "face_visible")
@@ -366,8 +402,8 @@ def generate_and_check(name, desc, scene_info, ref_bytes,
             continue
 
         check = run_adaptive_check(
-            ref_bytes, image_bytes, scene_type,
-            check_method, df_thr, clip_thr, dino_thr
+            ref_bytes, image_bytes, scene_text, scene_type,
+            df_thr, clip_thr, clip_text_thr
         )
         attempt_passed = check["overall_passed"]
         fail_reason = check.get("fail_reason")
@@ -377,8 +413,8 @@ def generate_and_check(name, desc, scene_info, ref_bytes,
             active_score = check.get("deepface_score", -1)
         elif scene_type == "face_hidden":
             active_score = check.get("clip_score", -1)
-        else:
-            active_score = check.get("dino_score", -1)
+        else:  # crowd
+            active_score = check.get("clip_text_score", -1)
 
         if active_score != -1:
             prev_score = active_score
@@ -389,7 +425,7 @@ def generate_and_check(name, desc, scene_info, ref_bytes,
                 "active": active_score,
                 "deepface": check.get("deepface_score", -1),
                 "clip": check.get("clip_score", -1),
-                "dino": check.get("dino_score", -1),
+                "clip_text": check.get("clip_text_score", -1),
             }
 
         all_attempts.append({
@@ -405,12 +441,11 @@ def generate_and_check(name, desc, scene_info, ref_bytes,
         if attempt_passed:
             passed = True
             active_models = check.get("active_models", [])
-            score_summary = " | ".join([
-                f"DeepFace:{check.get('deepface_score',-1)}점" if "deepface" in active_models else "",
-                f"CLIP:{check.get('clip_score',-1)}점" if "clip" in active_models else "",
-                f"DINOv2:{check.get('dino_score',-1)}점" if "dino" in active_models else "",
-            ]).strip(" |")
-            status_box.success(f"✅ **{label}** 통과! ({score_summary})")
+            score_parts = []
+            if "deepface"  in active_models: score_parts.append(f"DeepFace:{check.get('deepface_score',-1)}점")
+            if "clip"      in active_models: score_parts.append(f"CLIP:{check.get('clip_score',-1)}점")
+            if "clip_text" in active_models: score_parts.append(f"CLIP-Text:{check.get('clip_text_score',-1)}점")
+            status_box.success(f"✅ **{label}** 통과! ({' | '.join(score_parts)})")
             break
         else:
             status_box.warning(f"⚠️ **{label}** {attempt}차 탈락 — {fail_reason}")
@@ -420,8 +455,10 @@ def generate_and_check(name, desc, scene_info, ref_bytes,
             f"⚠️ **{label}** 최고점 채택 "
             f"(DeepFace:{best_scores.get('deepface',-1)} / "
             f"CLIP:{best_scores.get('clip',-1)} / "
-            f"DINOv2:{best_scores.get('dino',-1)})"
+            f"CLIP-Text:{best_scores.get('clip_text',-1)})"
         )
+    elif not best_image:
+        status_box.error(f"❌ **{label}** 이미지 생성 실패 — 모든 시도에서 이미지를 받지 못했습니다.")
 
     return {
         "image_bytes": best_image,
@@ -429,6 +466,7 @@ def generate_and_check(name, desc, scene_info, ref_bytes,
         "best_scores": best_scores,
         "all_attempts": all_attempts,
         "scene_type": scene_type,
+        "failed": best_image is None,
     }
 
 
@@ -500,7 +538,7 @@ def make_scenario_txt(char_name, act_plan, scenes_by_act, storyboard_data):
                     sc = sb.get("best_scores", {})
                     score_line = (
                         f"  → 검수: DeepFace {sc.get('deepface',-1)}점 | "
-                        f"CLIP {sc.get('clip',-1)}점 | DINOv2 {sc.get('dino',-1)}점 | "
+                        f"CLIP {sc.get('clip',-1)}점 | CLIP-Text {sc.get('clip_text',-1)}점 | "
                         f"{'✅ 통과' if sb.get('passed') else '⚠️ 최고점 채택'}"
                     )
                     break
@@ -527,7 +565,6 @@ if st.session_state.stage == 'input':
     avail = []
     avail.append("✅ DeepFace" if DEEPFACE_AVAILABLE else "❌ DeepFace")
     avail.append("✅ CLIP" if CLIP_AVAILABLE else "❌ CLIP")
-    avail.append("✅ DINOv2" if DINO_AVAILABLE else "❌ DINOv2")
     st.info("검수 모델: " + " | ".join(avail))
 
     topic = st.text_input("주인공 외형/연출 의도",
@@ -558,21 +595,18 @@ if st.session_state.stage == 'input':
                     name = st.session_state.char_name
                     desc = st.session_state.char_description
                     turnaround_prompt = (
-                        f"Professional character design turnaround sheet of {name}. "
+                        f"Professional 3D character design turnaround sheet of {name}. "
                         f"Character appearance: {desc}. "
                         "THREE VIEWS side by side in a single image: "
                         "LEFT: full-body FRONT VIEW facing camera directly. "
                         "CENTER: full-body SIDE VIEW (90 degree profile, facing right). "
                         "RIGHT: full-body BACK VIEW facing away from camera. "
-                        "All three views show the EXACT SAME character with identical costume, "
-                        "proportions, colors, and details. "
+                        "All three views show the EXACT SAME character with identical costume, proportions, colors, and details. "
                         "Pure solid white background. No shadows on background. "
                         "Full body visible from head to toe in each view. "
                         "Character centered and same height in all three panels. "
                         "Clean separation between the three views. "
-                        "Hyperrealistic render, 8K resolution, professional studio lighting, "
-                        "flat even lighting to show all costume details clearly, "
-                        "concept art quality, character reference sheet style."
+                        "High quality 3D animation style, cute stylized character, clean Blender 3D render, soft studio lighting, character reference sheet style."
                     )
                     result = client.models.generate_images(
                         model='imagen-4.0-generate-001',
@@ -634,30 +668,27 @@ elif st.session_state.stage == 'scenario':
                     plan_resp = client.models.generate_content(
                         model='gemini-2.5-flash',
                         contents=f"""
-당신은 영화 편집 전문가입니다. 아래 5분(300초) 단편 영화 줄거리를 분석하세요.
+당신은 애니메이션 편집 전문가입니다. 아래 줄거리를 분석하여 약 30~50초 분량의 핵심 시퀀스 스토리보드를 기획하세요.
 
 [분석 기준]
-- 장르별 평균 씬 지속시간:
-  * 액션/스릴러: 씬당 10~20초 (빠른 컷)
-  * 공포/서스펜스: 씬당 15~25초 (긴장 고조)
-  * 드라마/감성: 씬당 25~45초 (느린 호흡)
-  * SF/판타지: 씬당 20~35초 (세계관 설명 필요)
-  * 아트/실험: 씬당 30~60초 (관조적)
+- 애니메이션/영화의 실제 컷(Cut) 지속시간은 매우 짧습니다.
+- 장르별 평균 컷(Cut) 지속시간:
+  * 액션/스릴러: 컷당 1~3초 (빠른 전환)
+  * 일상/드라마: 컷당 3~6초 (표정 및 대사 전달)
+  * 설명/풍경: 컷당 5~8초 (상황 전달)
 
-- 3막 시간 배분 원칙:
-  * 1막(설정): 전체의 20~25%
-  * 2막(대립): 전체의 50~55%
-  * 3막(해결): 전체의 20~25%
-
-- 씬 수 범위: 막당 최소 2개, 최대 5개
+- 3막 구조 컷 수 배분 (총 10컷 내외로 구성):
+  * 1막(설정): 2~3컷
+  * 2막(대립): 4~6컷
+  * 3막(해결): 2~3컷
 
 [출력 형식] 반드시 아래 JSON만 출력하세요. 다른 텍스트 없이:
 {{
   "genre": "장르명",
   "pacing": "fast/medium/slow",
-  "avg_scene_duration": 평균씬길이(초),
-  "total_duration_sec": 300,
-  "reasoning": "씬 수 결정 근거 (한국어, 2~3문장)",
+  "avg_scene_duration": 평균컷길이(초),
+  "total_duration_sec": 전체합산시간(초),
+  "reasoning": "컷 수 결정 근거 (한국어, 2문장 이내)",
   "act1_scenes": N,
   "act1_duration": 초,
   "act2_scenes": N,
@@ -795,11 +826,11 @@ elif st.session_state.stage == 'scenario':
                             key=f"dur_{act_kr}_{j}"
                         )
                         cfg = SCENE_TYPE_CONFIG.get(edited_type, {})
-                        st.caption(
+                    st.caption(
                             f"적용 모델:\n"
                             f"{'✅' if cfg.get('use_deepface') else '⬜'} DeepFace\n"
-                            f"{'✅' if cfg.get('use_clip') else '⬜'} CLIP\n"
-                            f"{'✅' if cfg.get('use_dino') else '⬜'} DINOv2"
+                            f"{'✅' if cfg.get('use_clip') else '⬜'} CLIP image\n"
+                            f"{'✅' if cfg.get('use_clip_text') else '⬜'} CLIP text\n"
                         )
 
                     edited_scenes[act_kr].append({
@@ -837,28 +868,21 @@ elif st.session_state.stage == 'sample':
     st.info("전체 생성 전에 각 막 첫 씬만 먼저 생성해서 검수 설정을 확인합니다.")
 
     with st.expander("⚙️ 검수 설정", expanded=True):
-        check_method = st.radio(
-            "재생성 판정 기준 (씬 유형이 face_hidden/crowd이면 자동 override됩니다)",
-            ["A: DeepFace + CLIP", "B: DINOv2"],
-            index=0 if st.session_state.check_method.startswith("A") else 1,
-            horizontal=True
-        )
         col1, col2, col3 = st.columns(3)
         with col1:
             df_thr = st.slider("DeepFace 기준점", 30, 90, st.session_state.df_threshold, 5,
-                               help="face_visible 씬에만 적용")
+                               help="face_visible 씬에만 적용. 기본값 70점 = Facenet512 공식 동일인물 판정 기준 (cosine distance < 0.30)")
         with col2:
-            clip_thr = st.slider("CLIP 기준점", 30, 90, st.session_state.clip_threshold, 5,
-                                 help="face_visible + face_hidden 씬에 적용")
+            clip_thr = st.slider("CLIP image 기준점", 0, 100, st.session_state.clip_threshold, 5,
+                                 help="face_visible + face_hidden 씬에 적용 (캐릭터 외형 일관성)")
         with col3:
-            dino_thr = st.slider("DINOv2 기준점", 30, 90, st.session_state.dino_threshold, 5,
-                                 help="face_hidden + crowd 씬에 적용")
+            clip_text_thr = st.slider("CLIP text 기준점", 0, 100, st.session_state.clip_text_threshold, 5,
+                                      help="face_hidden + crowd 씬에 적용 (씬 묘사 부합도)")
         max_retries = st.slider("최대 재시도", 1, 5, st.session_state.max_retries)
 
-        st.session_state.check_method = check_method
         st.session_state.df_threshold = df_thr
         st.session_state.clip_threshold = clip_thr
-        st.session_state.dino_threshold = dino_thr
+        st.session_state.clip_text_threshold = clip_text_thr
         st.session_state.max_retries = max_retries
 
     if st.button("🧪 샘플 3컷 생성", use_container_width=True):
@@ -875,7 +899,7 @@ elif st.session_state.stage == 'sample':
 
             result = generate_and_check(
                 name, desc, sample_scene_info, ref_bytes,
-                check_method, df_thr, clip_thr, dino_thr, max_retries,
+                df_thr, clip_thr, clip_text_thr, max_retries,
                 label, status_box
             )
             result["act"] = act_kr
@@ -898,12 +922,18 @@ elif st.session_state.stage == 'sample':
                 scene_type = sample.get("scene_type", "face_visible")
                 cfg = SCENE_TYPE_CONFIG.get(scene_type, {})
 
-                st.image(sample["image_bytes"], caption=f"{act_kr} 샘플")
+                if sample.get("image_bytes") is None:
+                    st.error(f"❌ {act_kr} 이미지 생성 실패")
+                else:
+                    st.image(sample["image_bytes"], caption=f"{act_kr} 샘플")
                 st.caption(f"{cfg.get('emoji','')} {cfg.get('label', scene_type)}")
                 st.caption(score_badge(scores.get("deepface",-1), "DeepFace", df_thr, cfg.get("use_deepface",True)))
-                st.caption(score_badge(scores.get("clip",-1), "CLIP", clip_thr, cfg.get("use_clip",True)))
-                st.caption(score_badge(scores.get("dino",-1), "DINOv2", dino_thr, cfg.get("use_dino",False)))
-                st.caption("✅ 통과" if sample.get("passed") else "⚠️ 최고점 채택")
+                st.caption(score_badge(scores.get("clip",-1), "CLIP image", clip_thr, cfg.get("use_clip",True)))
+                st.caption(score_badge(scores.get("clip_text",-1), "CLIP text", clip_text_thr, cfg.get("use_clip_text",False)))
+                if sample.get("failed"):
+                    st.caption("❌ 생성 실패")
+                else:
+                    st.caption("✅ 통과" if sample.get("passed") else "⚠️ 최고점 채택")
 
                 failed = [a for a in sample.get("all_attempts",[]) if not a["passed"]]
                 if failed:
@@ -918,7 +948,7 @@ elif st.session_state.stage == 'sample':
                             st.caption(
                                 f"DeepFace:{ch.get('deepface_score',-1)} | "
                                 f"CLIP:{ch.get('clip_score',-1)} | "
-                                f"DINOv2:{ch.get('dino_score',-1)}"
+                                f"CLIP-Text:{ch.get('clip_text_score',-1)}"
                             )
                             if a.get("fail_reason"):
                                 st.caption(f"탈락: {a['fail_reason']}")
@@ -949,16 +979,15 @@ elif st.session_state.stage == 'storyboard':
     desc = st.session_state.char_description
     scenes_by_act = st.session_state.scenes_by_act
     ref_bytes = st.session_state.character_image
-    check_method = st.session_state.check_method
     df_thr  = st.session_state.df_threshold
     clip_thr = st.session_state.clip_threshold
-    dino_thr = st.session_state.dino_threshold
+    clip_text_thr = st.session_state.clip_text_threshold
     max_retries = st.session_state.max_retries
 
     # ── 아직 생성 안 됐으면 생성 시작 ─────────────────────────
     if not st.session_state.storyboard_data:
         st.subheader(f"🎬 [{name}] 전체 스토리보드 생성 중...")
-        st.caption(f"기본 판정 방식: {check_method} | 재시도: {max_retries}회 | 씬 유형별 자동 override 적용")
+        st.caption(f"DeepFace / CLIP image / CLIP text | 재시도: {max_retries}회 | 씬 유형별 자동 적용")
 
         total_scenes = sum(len(v) for v in scenes_by_act.values())
         progress_bar = st.progress(0)
@@ -972,7 +1001,7 @@ elif st.session_state.stage == 'storyboard':
 
                 result = generate_and_check(
                     name, desc, scene_info, ref_bytes,
-                    check_method, df_thr, clip_thr, dino_thr, max_retries,
+                    df_thr, clip_thr, clip_text_thr, max_retries,
                     label, status_box
                 )
                 result["act"] = act_kr
@@ -1015,13 +1044,17 @@ elif st.session_state.stage == 'storyboard':
                     cfg = SCENE_TYPE_CONFIG.get(scene_type, {})
                     si = scene.get("scene_info", {})
 
-                    st.image(scene["image_bytes"],
-                             caption=f"{act_kr} {scene['cut_num']}컷")
+                    if scene.get("image_bytes") is None:
+                        st.error(f"❌ {act_kr} {scene['cut_num']}컷 이미지 생성 실패")
+                    else:
+                        st.image(scene["image_bytes"],
+                                 caption=f"{act_kr} {scene['cut_num']}컷")
                     st.caption(f"{cfg.get('emoji','')} {cfg.get('label', scene_type)} | {si.get('camera','')} | {si.get('duration',0)}초")
                     st.caption(score_badge(scores.get("deepface",-1), "DeepFace", df_thr, cfg.get("use_deepface",True)))
-                    st.caption(score_badge(scores.get("clip",-1), "CLIP", clip_thr, cfg.get("use_clip",True)))
-                    st.caption(score_badge(scores.get("dino",-1), "DINOv2", dino_thr, cfg.get("use_dino",False)))
-                    st.caption("✅ 통과" if scene.get("passed") else "⚠️ 최고점 채택")
+                    st.caption(score_badge(scores.get("clip",-1), "CLIP image", clip_thr, cfg.get("use_clip",True)))
+                    st.caption(score_badge(scores.get("clip_text",-1), "CLIP text", clip_text_thr, cfg.get("use_clip_text",False)))
+
+                    st.caption("✅ 통과" if scene.get("passed") else ("❌ 생성 실패" if scene.get("failed") else "⚠️ 최고점 채택"))
                     st.caption(scene['desc'][:45] + "...")
 
                     failed = [a for a in scene.get("all_attempts",[]) if not a["passed"]]
@@ -1038,7 +1071,7 @@ elif st.session_state.stage == 'storyboard':
                                 st.caption(
                                     f"DeepFace:{ch.get('deepface_score',-1)} | "
                                     f"CLIP:{ch.get('clip_score',-1)} | "
-                                    f"DINOv2:{ch.get('dino_score',-1)}"
+                                    f"CLIP-Text:{ch.get('clip_text_score',-1)}"
                                 )
                                 if a.get("fail_reason"):
                                     st.caption(f"탈락: {a['fail_reason']}")
