@@ -604,7 +604,7 @@ if st.session_state.stage == 'input':
                         "RIGHT: full-body BACK VIEW facing away from camera. "
                         "All three views show the EXACT SAME character with identical costume, proportions, colors, and details. "
                         "Pure solid white background. No shadows on background. "
-                        "Full body visible from head to toe in each view. "
+                        "Full body visible from head to bottom in each view. "
                         "Character centered and same height in all three panels. "
                         "Clean separation between the three views. "
                         "High quality 3D animation style, cute stylized character, clean Blender 3D render, soft studio lighting, character reference sheet style."
