@@ -184,6 +184,7 @@ def check_clip_image(ref_bytes, gen_bytes):
         result["clip_reason"] = f"{score}점"
     except Exception as e:
         result["clip_reason"] = str(e)
+        print("CLIP 오류:", e)
     return result
 
 
