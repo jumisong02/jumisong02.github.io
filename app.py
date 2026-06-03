@@ -34,7 +34,7 @@ _clip_tokenizer = None
 
 # ── API 클라이언트 ─────────────────────────────────────────────
 client = genai.Client(
-    api_key=st.secrets.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY")
+    api_key= os.environ.get("GEMINI_API_KEY")
 )
 
 # ── 세션 초기화 ────────────────────────────────────────────────
