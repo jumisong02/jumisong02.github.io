@@ -5,3 +5,4 @@ transformers
 deepface
 tf-keras
 Pillow
+open_clip_torch
