@@ -566,7 +566,7 @@ if st.session_state.stage == 'input':
     avail = []
     avail.append("✅ DeepFace" if DEEPFACE_AVAILABLE else "❌ DeepFace")
     avail.append("✅ CLIP" if CLIP_AVAILABLE else "❌ CLIP")
-    st.info("검수 모델: " + " | ".join(avail))
+    st.info("검수 모델 로딩: " + " | ".join(avail))
 
     topic = st.text_input("주인공 외형/연출 의도",
                           value=st.session_state.topic,
@@ -596,18 +596,18 @@ if st.session_state.stage == 'input':
                     name = st.session_state.char_name
                     desc = st.session_state.char_description
                     turnaround_prompt = (
-                        f"Professional 3D character design turnaround sheet of {name}. "
-                        f"Character appearance: {desc}. "
-                        "THREE VIEWS side by side in a single image: "
-                        "LEFT: full-body FRONT VIEW facing camera directly. "
-                        "CENTER: full-body SIDE VIEW (90 degree profile, facing right). "
-                        "RIGHT: full-body BACK VIEW facing away from camera. "
-                        "All three views show the EXACT SAME character with identical costume, proportions, colors, and details. "
-                        "Pure solid white background. No shadows on background. "
-                        "Full body visible from head to bottom in each view. "
-                        "Character centered and same height in all three panels. "
-                        "Clean separation between the three views. "
-                        "High quality 3D animation style, cute stylized character, clean Blender 3D render, soft studio lighting, character reference sheet style."
+                        f"Professional 3D character turnaround reference sheet of {name}. "
+                        f"Character: {desc}. "
+                        "STRICT LAYOUT RULE: This image is divided into exactly THREE equal vertical panels side by side. "
+                        "Panel 1 (LEFT THIRD of image): full-body FRONT VIEW, character facing directly toward camera. "
+                        "Panel 2 (CENTER THIRD of image): full-body SIDE VIEW, character facing right at exactly 90 degrees. "
+                        "Panel 3 (RIGHT THIRD of image): full-body BACK VIEW, character facing completely away from camera. "
+                        "All three panels MUST be present. Missing any panel is not acceptable. "
+                        "Each panel shows the full body from head to toe. "
+                        "Identical costume, colors, proportions across all three panels. "
+                        "Pure white background, no shadows, no text, no labels. "
+                        "Same character height in all three panels. "
+                        "High quality realistic 3D render, photorealistic textures, cinematic studio lighting, character reference sheet style."
                     )
                     result = client.models.generate_images(
                         model='imagen-4.0-generate-001',
